@@ -1,0 +1,278 @@
+pipeline {
+    agent any
+
+    environment {
+  
+        kube_namespace      = 'qg' // Неймспейс проекта (eng)
+        kube_cluster        = 'tests' 
+		kube_app 			= 'image-checker'
+        // Telegram
+        tg_tag              = '@sabsabbas' 
+        tg_name             = 'Quality Gate' 
+
+		stage_upload        = 'true'  //Этап загрузки образа
+        stage_check_bench   = 'true'  // Этап запуска чеков
+        stage_check_trivy   = 'true' // запуск trivy
+        stage_check_trufflehog   = 'true' // запуск поиска секретов
+        stage_telegram  = 'true'  // Отправка уведомлений в телеграм
+        stage_clean     = 'true'  // Удаляем за собой мусор
+        // ----------------------------- ЭТАПЫ СБОРКИ ---------------------------- //
+        harbor_url              = '--internal-hrabor'
+        harbor_creds            = '--some-harbor-creds--'
+
+        // Kubernetes
+        kube_credentials        = "kube-${kube_cluster}"
+
+        // Telegram
+        tg_ok                   = "${tg_tag}, сборка <b>${tg_name}</b> прошла успешно!"
+        tg_fail                 = "${tg_tag} что-то пошло не так! Сборка проекта <b>${tg_name}</b> провалилась..."
+        tg_key                  = credentials('--jenkins--secret--')
+        tg_chat                 = credentials('--jenkins--secret--')
+        tg_url                  = "https://api.telegram.org/bot${tg_key}/sendMessage -d chat_id=${tg_chat} -d parse_mode=HTML -d text="
+        tg_icon_success         = '✅'
+        tg_icon_failed          = '⛔'
+        // Docker
+        imagename               = "${harbor_url}/${harbor_project}/${harbor_image_name}-${BRANCH}"
+
+        }
+
+
+
+    stages {
+
+        stage('upload tar') {
+
+            when {
+                allOf {
+                    environment(name: "stage_upload", value: "true")
+                }
+
+            }
+            steps {
+                sh "mkdir report || true"
+                script {
+                    docker.withRegistry( "https://${harbor_url}", harbor_creds ) {
+                        sh "docker pull ${IMAGE}"
+        				sh "docker save  ${IMAGE} -o app.tar"
+
+    				}
+                }
+				withKubeConfig([credentialsId: env.kube_credentials , namespace: '${kube_namespace}']) {
+
+
+				    script {
+    					POD_NAME = sh(returnStdout: true, script: "kubectl get pod -l app=${kube_app} -n=${kube_namespace} -o jsonpath=\"{.items[0].metadata.name}\"").trim()
+    				}
+					// Закачиваем к куб образ
+					sh "kubectl cp app.tar  ${kube_namespace}/${POD_NAME}:/opt/sources/app.tar "
+					//sh """kubectl exec ${POD_NAME} -n=${kube_namespace} --  bash -c " rm -rf /opt/sources/app && mkdir /opt/sources/app && tar -xf /opt/sources/app.tar -C /opt/sources/app" """
+    				sh "kubectl exec ${POD_NAME} -n=${kube_namespace} --  docker load --input  /opt/sources/app.tar"
+
+					sh "kubectl exec ${POD_NAME} -n=${kube_namespace} --  docker run -it -d --name stub ${IMAGE}"
+				}
+            }
+        }
+
+
+
+
+
+        stage('check docker-bench') {
+            when { expression { env.stage_check_bench == 'true' } }
+
+            steps   {
+				withKubeConfig([credentialsId: env.kube_credentials , namespace: '${kube_namespace}']) {
+
+					// Docker-bench
+					sh """kubectl exec ${POD_NAME} -n ${kube_namespace}  -- bash -c " cd /opt/docker-bench-security/ && ./docker-bench-security.sh -b -c container_images,container_runtime -l stub" >./report/docker-bench-full """
+                    sh """ cat ./report/docker-bench-full | grep "WARN" > ./report/docker-bench |true """
+                    script {
+
+                        def output_list = readFile("./report/docker-bench")
+                        if (output_list.size() == 0) {
+                            env.DOCKER_CHECK='ok'
+                        }
+                        else {
+                            env.DOCKER_CHECK='warning'
+
+                        }
+
+
+
+                    }
+				}
+			}
+        }
+
+        stage('check trufflehog') {
+            when { expression { env.stage_check_trufflehog == 'true' } }
+
+            steps   {
+				withKubeConfig([credentialsId: env.kube_credentials , namespace: '${kube_namespace}']) {
+
+					// trufflehog
+					sh """kubectl exec ${POD_NAME} -n ${kube_namespace}  -- bash -c " trufflehog docker --image  file:///opt/sources/app.tar --only-verified " >./report/trufflehog """
+                    script {
+
+                        def output_list = readFile("./report/trufflehog")
+                        if (output_list.size() == 0) {
+                            env.TRUFFLE_CHECK='ok'
+                        }
+                        else {
+                            env.TRUFFLE_CHECK='warning'
+
+                        }
+
+
+
+                }
+
+		        }
+            }
+        }
+        stage('check trivy') {
+            when { expression { env.stage_check_trivy == 'true' } }
+
+            steps   {
+				withKubeConfig([credentialsId: env.kube_credentials , namespace: '${kube_namespace}']) {
+
+					// trivy
+					sh """kubectl exec ${POD_NAME} -n ${kube_namespace}  -- bash -c "trivy image --severity CRITICAL,HIGH $image  " >./report/trivy-full """
+					sh """cat ./report/trivy-full | grep -E "CRITICAL|HIGH" |wc -l >./report/trivy-count"""
+
+                    script {
+
+                        def count = readFile("./report/trivy-count").toInteger()
+                        print(count)
+                        if (count > 2) {
+                            env.TRIVY_CHECK='warning'
+                        }
+                        else {
+                            env.TRIVY_CHECK='ok'
+
+                        }
+
+
+
+                }
+
+		        }
+            }
+        }
+        stage('check php') {
+            when { expression { env.LANG == 'php' } }
+
+            steps   {
+				withKubeConfig([credentialsId: env.kube_credentials , namespace: '${kube_namespace}']) {
+
+					// trivy
+					sh """kubectl exec ${POD_NAME} -n ${kube_namespace}  -- bash -c "docker exec -i stub /bin/sh -c  \\\"composer audit\\\" > /opt/composer-report  " | true"""
+					sh "kubectl cp  ${kube_namespace}/${POD_NAME}:/opt/composer-report ./report/composer-report "
+					sh """kubectl exec ${POD_NAME} -n ${kube_namespace}  -- rm -rf /opt/composer-report   """
+					sh """cat ./report/composer-report | grep -E "critical|high" | wc -l>./report/composer-count"""
+
+                    script {
+
+                        def count = readFile("./report/composer-count").toInteger()
+
+                        if (count > 1) {
+                            env.COMPOSER_CHECK='warning'
+                        }
+                        else {
+                            env.COMPOSER_CHECK='ok'
+
+                        }
+
+
+
+                    }
+
+		        }
+            }
+        }
+        stage('artifacts') {
+
+            steps   {
+                archiveArtifacts artifacts: 'report/'
+
+			}
+        }
+
+
+    // Конец стейджей
+    }
+
+
+post {
+    // Отправка в телегу статуса сборки
+    success {
+    script {
+        if (env.stage_telegram == 'true') {
+            if (env.stage_check_bench == 'true') {
+
+                if (env.DOCKER_CHECK=='warning'){
+                    sh """curl  -s -S -L -F document=@"./report/docker-bench"  -F parse_mode='Html' -F chat_id="${tg_chat}" -F caption="${tg_icon_failed} ${currentBuild.fullDisplayName}  \n\n${tg_ok} \n\n<b>Проверка docker-bench содержит предупреждения</b>\n\n<b>Образ:</b> ${IMAGE} \n\n<b>LOG сборки:</b> ${env.BUILD_URL}console"  -X POST https://api.telegram.org/bot${tg_key}/sendDocument """
+                }
+                else {
+                    sh """curl  -s -S -L  -F parse_mode='Html' -F chat_id="${tg_chat}" -F text="${tg_icon_success} ${currentBuild.fullDisplayName}  \n\n${tg_ok} \n\n<b>Проверка docker-bench показала что все чисто</b>\n\n<b>Образ:</b> ${IMAGE} \n\n<b>LOG сборки:</b> ${env.BUILD_URL}console"  -X POST https://api.telegram.org/bot${tg_key}/sendMessage """
+
+
+                }
+            }
+            if (env.stage_check_trufflehog == 'true' ) {
+                if (env.TRUFFLE_CHECK=='warning'){
+                    sh """curl  -s -S -L -F document=@"./report/trufflehog"  -F parse_mode='Html' -F chat_id="${tg_chat}" -F caption="${tg_icon_failed} ${currentBuild.fullDisplayName}  \n\n${tg_ok} \n\n<b>Проверка trufflehog содержит предупреждения в аттаче</b>\n\n<b>Образ:</b> ${IMAGE} \n\n<b>LOG сборки:</b> ${env.BUILD_URL}console"  -X POST https://api.telegram.org/bot${tg_key}/sendDocument """
+                }
+                else {
+                    sh """curl  -s -S -L  -F parse_mode='Html' -F chat_id="${tg_chat}" -F text="${tg_icon_success} ${currentBuild.fullDisplayName}  \n\n${tg_ok} \n\n<b>Проверка trufflehog показала что все чисто</b>\n\n<b>Образ:</b> ${IMAGE} \n\n<b>LOG сборки:</b> ${env.BUILD_URL}console"  -X POST https://api.telegram.org/bot${tg_key}/sendMessage """
+
+
+                }
+            }
+            if (env.stage_check_trivy == 'true' ) {
+                if (env.TRIVY_CHECK=='warning'){
+                    sh """curl  -s -S -L -F document=@"./report/trivy-full"  -F parse_mode='Html' -F chat_id="${tg_chat}" -F caption="${tg_icon_failed} ${currentBuild.fullDisplayName}  \n\n${tg_ok} \n\n<b>Проверка trivy содержит предупреждения в аттаче</b>\n\n<b>Образ:</b> ${IMAGE} \n\n<b>LOG сборки:</b> ${env.BUILD_URL}console"  -X POST https://api.telegram.org/bot${tg_key}/sendDocument """
+                }
+                else {
+                    sh """curl  -s -S -L  -F parse_mode='Html' -F chat_id="${tg_chat}" -F text="${tg_icon_success} ${currentBuild.fullDisplayName}  \n\n${tg_ok} \n\n<b>Проверка trivy показала что все чисто</b>\n\n<b>Образ:</b> ${IMAGE} \n\n<b>LOG сборки:</b> ${env.BUILD_URL}console"  -X POST https://api.telegram.org/bot${tg_key}/sendMessage """
+
+
+                }
+            }
+            if (env.LANG == 'php') {
+                if (env.COMPOSER_CHECK=='warning'){
+                    sh """curl  -s -S -L -F document=@"./report/composer-report"  -F parse_mode='Html' -F chat_id="${tg_chat}" -F caption="${tg_icon_failed} ${currentBuild.fullDisplayName}  \n\n${tg_ok} \n\n<b>Проверка composer audit содержит предупреждения в аттаче</b>\n\n<b>Образ:</b> ${IMAGE} \n\n<b>LOG сборки:</b> ${env.BUILD_URL}console"  -X POST https://api.telegram.org/bot${tg_key}/sendDocument """
+                }
+                else {
+                    sh """curl  -s -S -L  -F parse_mode='Html' -F chat_id="${tg_chat}" -F text="${tg_icon_success} ${currentBuild.fullDisplayName}  \n\n${tg_ok} \n\n<b>Проверка composer audit показала что все чисто</b>\n\n<b>Образ:</b> ${IMAGE} \n\n<b>LOG сборки:</b> ${env.BUILD_URL}console"  -X POST https://api.telegram.org/bot${tg_key}/sendMessage """
+
+
+                }
+
+
+            }
+            deleteDir()
+
+        }}}
+    failure {
+    script {
+        if (env.stage_telegram == 'true') {
+            sh "curl -s -X POST ${tg_url}\"${tg_icon_failed} ${currentBuild.fullDisplayName}  \n\n${tg_fail} \n\n<b>LOG сборки:</b> ${env.BUILD_URL}console\""
+        }}}
+
+    always { script {
+        if (env.stage_clean == 'true') {
+                withKubeConfig([credentialsId: env.kube_credentials , namespace: '${kube_namespace}']) {
+					// Удаляем контейнеры
+					sh """kubectl exec ${POD_NAME} -n ${kube_namespace}  -- bash -c " docker stop \\\$(docker ps -a -q) " """
+					sh """kubectl exec ${POD_NAME} -n ${kube_namespace}  -- bash -c " docker rm -v -f \\\$(docker ps -qa) " """
+					sh """kubectl exec ${POD_NAME} -n ${kube_namespace}  -- bash -c " docker rmi -f \\\$(docker images -aq) "  """
+
+				}
+
+
+        }
+
+    } }
+}
+}
