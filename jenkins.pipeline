@@ -5,7 +5,7 @@ pipeline {
   
         kube_namespace      = 'qg' // Неймспейс проекта (eng)
         kube_cluster        = 'tests' 
-		kube_app 			= 'image-checker'
+        kube_app 			= 'image-checker'
         // Telegram
         tg_tag              = '@sabsabbas' 
         tg_name             = 'Quality Gate' 
@@ -14,6 +14,7 @@ pipeline {
         stage_check_bench   = 'true'  // Этап запуска чеков
         stage_check_trivy   = 'true' // запуск trivy
         stage_check_trufflehog   = 'true' // запуск поиска секретов
+        stage_sonar        =   'false'
         stage_telegram  = 'true'  // Отправка уведомлений в телеграм
         stage_clean     = 'true'  // Удаляем за собой мусор
         // ----------------------------- ЭТАПЫ СБОРКИ ---------------------------- //
@@ -33,7 +34,7 @@ pipeline {
         tg_icon_failed          = '⛔'
         // Docker
         imagename               = "${harbor_url}/${harbor_project}/${harbor_image_name}-${BRANCH}"
-
+        sonarqube               =  tool 'SonarQubeScanner'
         }
 
 
@@ -189,6 +190,15 @@ pipeline {
 
 		        }
             }
+        }
+        stage('Sonar') {
+             when { expression { env.stage_sonar == 'true' } }
+             steps {
+                 // Отправляем код в SonarQube на тесты
+                 withSonarQubeEnv('SonarQubeScanner') {
+                     sh "${sonarqube}/bin/sonar-scanner"
+                 }
+             }
         }
         stage('artifacts') {
 
